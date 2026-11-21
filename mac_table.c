@@ -103,3 +103,40 @@ void mac_table_insert(struct mac_table *t, const uint8_t mac[6], int port)
         printf("MAC moved: port %d -> port %d\n", old_port, port);
     }
 }
+void mac_table_foreach(struct mac_table *t, mac_visit_fn fn, void *arg)
+{
+    struct mac_entry *e;
+    int               i;
+
+    for (i = 0; i < NBUCKETS; i++)
+    {
+        pthread_mutex_lock(&t->bucket[i].lock);
+        for (e = t->bucket[i].head; e != NULL; e = e->next)
+        {
+            fn(e->mac, e->port, arg);
+        }
+        pthread_mutex_unlock(&t->bucket[i].lock);
+    }
+}
+
+int mac_table_clear(struct mac_table *t)
+{
+    struct mac_entry *e;
+    struct mac_entry *next;
+    int               removed = 0;
+    int               i;
+
+    for (i = 0; i < NBUCKETS; i++)
+    {
+        pthread_mutex_lock(&t->bucket[i].lock);
+        for (e = t->bucket[i].head; e != NULL; e = next)
+        {
+            next = e->next;
+            free(e);
+            removed++;
+        }
+        t->bucket[i].head = NULL;
+        pthread_mutex_unlock(&t->bucket[i].lock);
+    }
+    return removed;
+}
