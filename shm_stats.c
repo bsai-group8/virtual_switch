@@ -1,20 +1,21 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include "shm_stats.h"
-
 #include <fcntl.h>
 #include <stdio.h>
-#include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#include "shm_stats.h"
 
 struct shm_stats *shm_stats_create(int nports)
 {
-    struct shm_stats *s;
     pthread_mutexattr_t attr;
+    struct shm_stats *s;
     int fd;
 
-    fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0600);
+    shm_unlink(SHM_NAME);
+    fd = shm_open(SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0)
     {
         perror("shm_open");
@@ -24,6 +25,7 @@ struct shm_stats *shm_stats_create(int nports)
     {
         perror("ftruncate");
         close(fd);
+        shm_unlink(SHM_NAME);
         return NULL;
     }
     s = mmap(NULL, sizeof *s, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -31,24 +33,28 @@ struct shm_stats *shm_stats_create(int nports)
     if (s == MAP_FAILED)
     {
         perror("mmap");
+        shm_unlink(SHM_NAME);
         return NULL;
     }
-
-    memset(s, 0, sizeof *s);
-    s->nports = nports;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-    pthread_mutex_init(&s->lock, &attr);
+    if (pthread_mutexattr_init(&attr) != 0
+        || pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED) != 0
+        || pthread_mutex_init(&s->lock, &attr) != 0)
+    {
+        fprintf(stderr, "cannot create the shared mutex\n");
+        munmap(s, sizeof *s);
+        shm_unlink(SHM_NAME);
+        return NULL;
+    }
     pthread_mutexattr_destroy(&attr);
+    s->nports = nports;
     return s;
 }
 
 struct shm_stats *shm_stats_attach(void)
 {
     struct shm_stats *s;
-    int fd;
+    int fd = shm_open(SHM_NAME, O_RDWR, 0);
 
-    fd = shm_open(SHM_NAME, O_RDWR, 0);
     if (fd < 0)
     {
         return NULL;
@@ -56,6 +62,11 @@ struct shm_stats *shm_stats_attach(void)
     s = mmap(NULL, sizeof *s, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     return s == MAP_FAILED ? NULL : s;
+}
+
+void shm_stats_detach(struct shm_stats *s)
+{
+    munmap(s, sizeof *s);
 }
 
 void shm_stats_destroy(struct shm_stats *s)

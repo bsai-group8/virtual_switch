@@ -1,5 +1,3 @@
-# Virtual Switch - Operating Systems, Fall 2026
-
 CC      = gcc
 CFLAGS  = -std=c11 -Wall -Wextra -Werror -g -O0 -pthread \
           -D_POSIX_C_SOURCE=200809L
@@ -8,7 +6,7 @@ LDLIBS  = -lrt
 
 BINS = switch swctl host
 
-SWITCH_OBJS = switch.o frame.o mac_table.o shm_stats.o
+SWITCH_OBJS = switch.o frame.o mac_table.o queue.o logger.o shm_stats.o
 SWCTL_OBJS  = swctl.o shm_stats.o
 HOST_OBJS   = host.o frame.o
 
@@ -33,7 +31,6 @@ switch.o:    switch.c mac_table.h shm_stats.h
 swctl.o:     swctl.c shm_stats.h
 host.o:      host.c frame.h
 
-# the two tools the brief says it runs
 tsan: CFLAGS  += -fsanitize=thread
 tsan: LDFLAGS += -fsanitize=thread
 tsan: clean all

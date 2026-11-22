@@ -1,268 +1,156 @@
-/*
- * host - a test host for the virtual switch.
- *
- *   ./host <switch_ip> <tcp_port> <mac>
- *
- * Two threads:
- *   main      reads commands from stdin and writes frames to the socket
- *   receiver  reads frames from the socket and prints them
- *
- * stdin commands:
- *   send <dst_mac> <text>      unicast
- *   bcast <text>               broadcast (ff:ff:ff:ff:ff:ff)
- *   prio <0|1|2>               priority of later frames (0 high .. 2 low)
- *   vlan <1..4094>             vlan tag of later frames
- *   flood <count> <dst_mac>    blast <count> frames, for load tests
- *   sleep <ms>                 go deaf for a while (tests head of line
- *                              blocking: the other hosts must keep running)
- *   quit
- */
+#define _POSIX_C_SOURCE 200809L
 
-#include "frame.h"
-#include "mac_table.h"
-#include <errno.h>
-#include <netdb.h>
-#include <pthread.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
 
-static int     sock_fd = -1;
-static uint8_t my_mac[MAC_LEN];
+#include "frame.h"
 
-/* Guards writes to the socket: main and the sleep command both touch it. */
-static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
+#define LINGER_MS 1000
 
-static const uint8_t bcast_mac[MAC_LEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+static void print_frame(const struct frame *f)
+{
+    char s[MAC_STR_LEN], d[MAC_STR_LEN];
 
-static void *receiver_main(void *arg)
+    mac_format(f->src, s);
+    mac_format(f->dst, d);
+    printf("recv src=%s dst=%s vlan=%u pri=%u \"%.*s\"\n", s, d, f->vlan, f->prio,
+           (int)f->len, (const char *)f->payload);
+    fflush(stdout);
+}
+
+static int send_line(int sock, const uint8_t *mac, int vlan, int prio, char *line)
 {
     struct frame *f;
-    char          src[MAC_STR_LEN];
-    char          dst[MAC_STR_LEN];
-    int           rc;
+    char *text = strchr(line, ' ');
+    size_t len;
+    int rc;
 
-    (void)arg;
-    for (;;)
+    if (text == NULL)
     {
-        rc = frame_recv(sock_fd, &f);
-        if (rc <= 0)
-        {
-            if (rc == 0)
-            {
-                fprintf(stderr, "host: switch closed the connection\n");
-            }
-            else
-            {
-                fprintf(stderr, "host: receive error: %s\n", strerror(errno));
-            }
-            break;
-        }
-        mac_format(f->hdr.src, src);
-        mac_format(f->hdr.dst, dst);
-        printf("RX  src=%s dst=%s vlan=%u prio=%u len=%u  \"%.*s\"\n", src, dst,
-               (unsigned)f->hdr.vlan, (unsigned)f->hdr.priority,
-               (unsigned)f->hdr.length, (int)f->hdr.length,
-               (const char *)f->payload);
-        fflush(stdout);
-        frame_unref(f);
+        fprintf(stderr, "usage: <dst_mac|bcast> <text>\n");
+        return 0;
     }
-    return NULL;
-}
-
-static int send_one(const uint8_t dst[MAC_LEN], uint16_t vlan, uint8_t prio,
-                    const char *text)
-{
-    struct mera_frame_header h;
-    struct frame            *f;
-    size_t                   len = strlen(text);
-    int                      rc;
-
-    if (len > FRAME_MAX_PAYLOAD)
+    *text++ = '\0';
+    len = strlen(text);
+    if (len > MAX_PAYLOAD)
     {
-        len = FRAME_MAX_PAYLOAD;
+        len = MAX_PAYLOAD;
     }
-    memset(&h, 0, sizeof h);
-    h.length = (uint16_t)len;
-    memcpy(h.src, my_mac, MAC_LEN);
-    memcpy(h.dst, dst, MAC_LEN);
-    h.vlan     = vlan;
-    h.priority = prio;
-
-    f = frame_new(&h, (const uint8_t *)text);
+    f = frame_new((uint16_t)len);
     if (f == NULL)
     {
-        fprintf(stderr, "host: out of memory\n");
         return -1;
     }
-    pthread_mutex_lock(&send_lock);
-    rc = frame_send(sock_fd, f);
-    pthread_mutex_unlock(&send_lock);
+    memcpy(f->src, mac, MAC_LEN);
+    if (strcmp(line, "bcast") == 0)
+    {
+        memset(f->dst, 0xff, MAC_LEN);
+    }
+    else if (mac_parse(line, f->dst) != 0)
+    {
+        fprintf(stderr, "bad destination mac\n");
+        frame_unref(f);
+        return 0;
+    }
+    f->vlan = (uint16_t)vlan;
+    f->prio = (uint8_t)prio;
+    memcpy(f->payload, text, len);
+    rc = frame_send(sock, f);
     frame_unref(f);
-
-    if (rc != 0)
-    {
-        fprintf(stderr, "host: send failed: %s\n", strerror(errno));
-    }
     return rc;
-}
-
-static int connect_to_switch(const char *ip, const char *port)
-{
-    struct addrinfo  hints;
-    struct addrinfo *res;
-    struct addrinfo *ai;
-    int              fd = -1;
-    int              rc;
-
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    rc = getaddrinfo(ip, port, &hints, &res);
-    if (rc != 0)
-    {
-        fprintf(stderr, "host: getaddrinfo: %s\n", gai_strerror(rc));
-        return -1;
-    }
-    for (ai = res; ai != NULL; ai = ai->ai_next)
-    {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0)
-        {
-            continue;
-        }
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
-        {
-            break;
-        }
-        close(fd);
-        fd = -1;
-    }
-    freeaddrinfo(res);
-    if (fd < 0)
-    {
-        fprintf(stderr, "host: cannot connect to %s:%s\n", ip, port);
-    }
-    return fd;
 }
 
 int main(int argc, char **argv)
 {
-    pthread_t rx_th;
-    char      line[2048];
-    char      arg[256];
-    uint8_t   dst[MAC_LEN];
-    uint16_t  vlan = 1;
-    uint8_t   prio = PRIO_NORMAL;
-    int       n;
-    int       i;
+    struct sockaddr_in addr;
+    struct pollfd pf[2];
+    struct frame *f;
+    uint8_t mac[MAC_LEN];
+    char line[MAX_PAYLOAD + 64];
+    int sock, vlan = 1, prio = 1, one = 1;
+    int stdin_open = 1, frozen = 0, n;
 
-    if (argc != 4)
+    if (argc < 4 || argc > 6 || mac_parse(argv[3], mac) != 0)
     {
-        fprintf(stderr, "usage: %s <switch_ip> <tcp_port> <mac>\n", argv[0]);
-        return 2;
-    }
-    if (mac_parse(argv[3], my_mac) != 0)
-    {
-        fprintf(stderr, "host: bad mac '%s', expected aa:bb:cc:dd:ee:ff\n",
-                argv[3]);
-        return 2;
-    }
-
-    /* A switch that goes away must give us EPIPE, not kill us. */
-    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
-    {
-        perror("signal");
+        fprintf(stderr, "usage: %s <switch_ip> <tcp_port> <mac> [vlan [priority]]\n", argv[0]);
         return 1;
     }
-
-    sock_fd = connect_to_switch(argv[1], argv[2]);
-    if (sock_fd < 0)
+    if (argc > 4)
     {
+        vlan = atoi(argv[4]);
+    }
+    if (argc > 5)
+    {
+        prio = atoi(argv[5]);
+    }
+    signal(SIGPIPE, SIG_IGN);
+
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)atoi(argv[2]));
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0 || inet_pton(AF_INET, argv[1], &addr.sin_addr) != 1
+        || connect(sock, (struct sockaddr *)&addr, sizeof addr) != 0)
+    {
+        perror("connect");
         return 1;
     }
-    if (pthread_create(&rx_th, NULL, receiver_main, NULL) != 0)
-    {
-        perror("pthread_create");
-        close(sock_fd);
-        return 1;
-    }
-    printf("host %s connected to %s:%s\n", argv[3], argv[1], argv[2]);
-    fflush(stdout);
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    setvbuf(stdin, NULL, _IONBF, 0);
 
-    while (fgets(line, sizeof line, stdin) != NULL)
+    for (;;)
     {
-        line[strcspn(line, "\r\n")] = '\0';
-
-        if (strcmp(line, "quit") == 0)
+        pf[0].fd = stdin_open ? 0 : -1;
+        pf[0].events = POLLIN;
+        pf[1].fd = frozen ? -1 : sock;
+        pf[1].events = POLLIN;
+        n = poll(pf, 2, stdin_open ? -1 : LINGER_MS);
+        if (n == 0)
         {
             break;
         }
-        if (sscanf(line, "prio %d", &n) == 1 && n >= 0 && n < NUM_PRIO)
+        if (n < 0)
         {
-            prio = (uint8_t)n;
-            continue;
+            perror("poll");
+            break;
         }
-        if (sscanf(line, "vlan %d", &n) == 1 && n >= VLAN_MIN && n <= VLAN_MAX)
+        if (pf[1].revents)
         {
-            vlan = (uint16_t)n;
-            continue;
-        }
-        if (sscanf(line, "sleep %d", &n) == 1 && n > 0)
-        {
-            struct timespec ts;
-            ts.tv_sec  = n / 1000;
-            ts.tv_nsec = (long)(n % 1000) * 1000000L;
-            nanosleep(&ts, NULL);
-            continue;
-        }
-        if (sscanf(line, "flood %d %31s", &n, arg) == 2)
-        {
-            if (mac_parse(arg, dst) != 0)
+            if (frame_recv(sock, &f) != 1)
             {
-                fprintf(stderr, "host: bad mac '%s'\n", arg);
+                printf("disconnected\n");
+                break;
+            }
+            print_frame(f);
+            frame_unref(f);
+        }
+        if (pf[0].revents)
+        {
+            if (fgets(line, sizeof line, stdin) == NULL)
+            {
+                stdin_open = 0;
                 continue;
             }
-            for (i = 0; i < n; i++)
+            line[strcspn(line, "\r\n")] = '\0';
+            if (strcmp(line, "freeze") == 0)
             {
-                char body[64];
-                snprintf(body, sizeof body, "flood %d", i);
-                if (send_one(dst, vlan, prio, body) != 0)
-                {
-                    break;
-                }
+                frozen = 1;
             }
-            continue;
-        }
-        if (strncmp(line, "bcast ", 6) == 0)
-        {
-            send_one(bcast_mac, vlan, prio, line + 6);
-            continue;
-        }
-        if (strncmp(line, "send ", 5) == 0)
-        {
-            char *sp;
-            if (sscanf(line + 5, "%31s", arg) != 1
-                || mac_parse(arg, dst) != 0)
+            else if (line[0] != '\0' && send_line(sock, mac, vlan, prio, line) != 0)
             {
-                fprintf(stderr, "host: usage: send <dst_mac> <text>\n");
-                continue;
+                printf("send failed\n");
+                break;
             }
-            sp = strchr(line + 5, ' ');
-            send_one(dst, vlan, prio, sp != NULL ? sp + 1 : "");
-            continue;
         }
-        fprintf(stderr, "host: unknown command '%s'\n", line);
     }
-
-    shutdown(sock_fd, SHUT_RDWR); /* unblocks the receiver thread */
-    pthread_join(rx_th, NULL);
-    close(sock_fd);
-    pthread_mutex_destroy(&send_lock);
+    close(sock);
     return 0;
 }
